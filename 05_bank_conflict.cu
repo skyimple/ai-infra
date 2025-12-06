@@ -13,6 +13,8 @@
 // ==========================================
 __global__ void copySharedMem(float *odata, const float *idata) {
     __shared__ float tile[TILE_DIM][TILE_DIM];
+    // 这里的y是row
+    // 这里的x是col
     int x = blockIdx.x * TILE_DIM + threadIdx.x;
     int y = blockIdx.y * TILE_DIM + threadIdx.y;
     int width = gridDim.x * TILE_DIM;
@@ -63,8 +65,19 @@ __global__ void transposeShared(float *odata, const float *idata) {
     // 2. 计算转置后的目标索引
     // 我们希望写出时，依然利用 threadIdx.x 连续变化来实现 Global Memory 合并写
     // 所以我们改变了 x, y 的计算逻辑：blockIdx.y 变成了新的 x 块坐标
+    
+    // 这里把原block (blockIdx.y, blockIdx.x)
+    // 写入新block (blockIdx.x, blockIdx.y)
     x = blockIdx.y * TILE_DIM + threadIdx.x; 
     y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    // 这里最核心的思想
+    // 读入的时候，是根据warp来的，连续读取一行
+    // 但在写出的时候，不是把读入的这一行一一转置
+    // 而是在新的转置后的矩阵内的这一行，应该对应哪些原矩阵的元素
+    // 因为读写一行是可以coalescing的
+    // 在写入的时候tile所以的已经读取完毕
+    // 所以可以实现读和写不一一对应
 
     if (x < width && y < width) {
         // 3. 从 Shared Memory 读出并写入 Global Memory
