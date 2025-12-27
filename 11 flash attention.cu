@@ -5,17 +5,17 @@
 
 template<int D>
 __global__ void flash_attention_warp_kernel(
-    const float* __restrict__ Q,  // [L, D] in HBM
-    const float* __restrict__ K,  // [L, D] in HBM
-    const float* __restrict__ V,  // [L, D] in HBM
-    float* __restrict__ O,        // [L, D] in HBM
+    const float* __restrict__ Q,  // [L, D]
+    const float* __restrict__ K,  // [L, D]
+    const float* __restrict__ V,  // [L, D]
+    float* __restrict__ O,        // [L, D]
     int L,
     float scale                  // 1 / sqrt(D)
 ) {
     // --------------------------------------------------
-    // 1. warp owns one query Q[i]
+    // 1. One warp computes one query Q[i]
     // --------------------------------------------------
-    int i   = blockIdx.x;     // query index
+    int i   = blockIdx.x;
     int tid = threadIdx.x;    // lane id [0,31]
 
     static_assert(D % 32 == 0, "D must be divisible by 32");
@@ -33,23 +33,19 @@ __global__ void flash_attention_warp_kernel(
     }
 
     // --------------------------------------------------
-    // 3. Online softmax state (warp-shared, replicated)
+    // 3. Online softmax state (replicated per lane)
     // --------------------------------------------------
-    float m_i = -FLT_MAX;   // max so far
-    float l_i = 0.0f;       // sum exp so far
+    float m_i = -FLT_MAX;
+    float l_i = 0.0f;
 
-    float o_reg[D / 32];
-    #pragma unroll
-    for (int d = 0; d < D / 32; ++d) {
-        o_reg[d] = 0.0f;
-    }
+    float o_reg[D / 32] = {0.0f};
 
     // --------------------------------------------------
-    // 4. Loop over all keys j
+    // 4. Loop over keys (SERIAL over j)
     // --------------------------------------------------
     for (int j = 0; j < L; ++j) {
 
-        // ---- 4.1 compute s_ij = Q_i · K_j
+        // ---- 4.1 dot(Q_i, K_j)
         const float* k_ptr = K + j * D;
 
         float dot = 0.0f;
@@ -58,7 +54,7 @@ __global__ void flash_attention_warp_kernel(
             dot += q_reg[d] * k_ptr[tid + d * 32];
         }
 
-        // warp-level reduction (sum)
+        // warp reduction → scalar s_ij
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             dot += __shfl_xor_sync(0xffffffff, dot, offset);
@@ -66,29 +62,14 @@ __global__ void flash_attention_warp_kernel(
 
         float s_ij = dot * scale;
 
-        // ---- 4.2 warp-level max(s_ij)
-        float m_ij = s_ij;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            m_ij = fmaxf(m_ij,
-                         __shfl_xor_sync(0xffffffff, m_ij, offset));
-        }
-
-        // ---- 4.3 online softmax update
-        float m_new = fmaxf(m_i, m_ij);
+        // ---- 4.2 online softmax (NO warp max!)
+        float m_new = fmaxf(m_i, s_ij);
         float alpha = expf(m_i - m_new);
         float p_ij  = expf(s_ij - m_new);
 
-        // warp-level sum exp
-        float p_sum = p_ij;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            p_sum += __shfl_xor_sync(0xffffffff, p_sum, offset);
-        }
+        l_i = alpha * l_i + p_ij;
 
-        l_i = alpha * l_i + p_sum;
-
-        // ---- 4.4 update output O_i
+        // ---- 4.3 update output accumulator
         const float* v_ptr = V + j * D;
         #pragma unroll
         for (int d = 0; d < D / 32; ++d) {
@@ -100,7 +81,7 @@ __global__ void flash_attention_warp_kernel(
     }
 
     // --------------------------------------------------
-    // 5. Normalize and write back (register → HBM)
+    // 5. Normalize and write back
     // --------------------------------------------------
     float inv_l = 1.0f / l_i;
     #pragma unroll
