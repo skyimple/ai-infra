@@ -1,92 +1,126 @@
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
 
-#define D 64        // head dimension
-#define MAX_N 1024  // 最大 key 数（示例用）
+#define TILE_K 128        // tile size along sequence length
+#define D 64              // embedding dimension (assumed fixed for simplicity)
 
-// Q: [M, D]
-// K: [N, D]
-// V: [N, D]
-// O: [M, D]
-
-__global__ void fused_attention_kernel(
-    const float* __restrict__ Q,   // HBM
-    const float* __restrict__ K,   // HBM
-    const float* __restrict__ V,   // HBM
-    float* __restrict__ O,         // HBM
-    int N
+__global__ void fused_self_attention(
+    const half* Q,   // [L, D]  --- HBM (global memory)
+    const half* K,   // [L, D]  --- HBM
+    const half* V,   // [L, D]  --- HBM
+    half* O,         // [L, D]  --- HBM (output)
+    int L
 ) {
-    // --------------------------------------------------
-    // block / thread 索引
-    // --------------------------------------------------
-    int q_idx = blockIdx.x;         // 当前 query
-    int tid   = threadIdx.x;
+    // ============================================================
+    // Block / thread indexing
+    // ============================================================
 
-    // --------------------------------------------------
-    // shared memory
-    // --------------------------------------------------
-    __shared__ float smem_Q[D];         // Q 向量
-    __shared__ float smem_scores[MAX_N]; // QK^T scores
+    int q_idx = blockIdx.x;      // which query row we compute
+    int tid   = threadIdx.x;     // thread id inside block
 
-    // --------------------------------------------------
-    // 1. load Q → shared
-    // --------------------------------------------------
+    // ============================================================
+    // Shared memory (on-chip SRAM, shared by block)
+    // ============================================================
+
+    __shared__ half K_tile[TILE_K][D];   // shared memory
+    __shared__ half V_tile[TILE_K][D];   // shared memory
+    __shared__ float score_tile[TILE_K]; // shared memory (QK scores)
+
+    // ============================================================
+    // Registers (private to each thread)
+    // ============================================================
+
+    float q_reg[D];        // registers: one query vector
+    float out_reg[D];      // registers: output accumulator
+    float sum_exp = 0.0f;  // registers: softmax denominator
+
+    // initialize output accumulator
+    #pragma unroll
+    for (int d = 0; d < D; d++) {
+        out_reg[d] = 0.0f;
+    }
+
+    // ============================================================
+    // Load Q[q_idx, :] into registers
+    // ============================================================
+    // Q is in HBM → registers
     if (tid < D) {
-        smem_Q[tid] = Q[q_idx * D + tid];   // HBM → shared
+        q_reg[tid] = __half2float(Q[q_idx * D + tid]);
     }
     __syncthreads();
 
-    // --------------------------------------------------
-    // 2. compute QK^T
-    // 每个线程算多个 key
-    // --------------------------------------------------
-    for (int k = tid; k < N; k += blockDim.x) {
-        float acc = 0.0f;  // register
+    // ============================================================
+    // Loop over K/V tiles
+    // ============================================================
 
-        #pragma unroll
-        for (int d = 0; d < D; ++d) {
-            acc += smem_Q[d] * K[k * D + d]; // shared × HBM → reg
+    for (int k0 = 0; k0 < L; k0 += TILE_K) {
+
+        int k_idx = k0 + tid;
+
+        // --------------------------------------------------------
+        // Load K and V tiles from HBM → shared memory
+        // --------------------------------------------------------
+        if (k_idx < L) {
+            #pragma unroll
+            for (int d = 0; d < D; d++) {
+                K_tile[tid][d] = K[k_idx * D + d];  // HBM → shared
+                V_tile[tid][d] = V[k_idx * D + d];  // HBM → shared
+            }
         }
+        __syncthreads();
 
-        smem_scores[k] = acc; // reg → shared
-    }
-    __syncthreads();
-
-    // --------------------------------------------------
-    // 3. softmax (naive two-pass)
-    // --------------------------------------------------
-    __shared__ float smem_max;
-    __shared__ float smem_sum;
-
-    if (tid == 0) {
-        float max_val = -1e20f;
-        for (int i = 0; i < N; ++i)
-            max_val = fmaxf(max_val, smem_scores[i]);
-        smem_max = max_val;
-    }
-    __syncthreads();
-
-    float local_sum = 0.0f;
-    for (int i = tid; i < N; i += blockDim.x) {
-        float e = __expf(smem_scores[i] - smem_max);
-        smem_scores[i] = e;
-        local_sum += e;
-    }
-
-    // block reduce
-    atomicAdd(&smem_sum, local_sum);
-    __syncthreads();
-
-    // --------------------------------------------------
-    // 4. weighted sum with V
-    // O[q] = softmax(QK^T) @ V
-    // --------------------------------------------------
-    for (int d = tid; d < D; d += blockDim.x) {
-        float out = 0.0f; // register
-        for (int k = 0; k < N; ++k) {
-            float w = smem_scores[k] / smem_sum;
-            out += w * V[k * D + d];   // HBM
+        // --------------------------------------------------------
+        // Compute Q · K^T  (dot product)
+        // Each thread computes score for one key
+        // --------------------------------------------------------
+        if (k_idx < L) {
+            float score = 0.0f;   // register
+            #pragma unroll
+            for (int d = 0; d < D; d++) {
+                score += q_reg[d] * __half2float(K_tile[tid][d]);
+            }
+            score /= sqrtf((float)D);
+            score_tile[tid] = score;   // register → shared
         }
-        O[q_idx * D + d] = out; // reg → HBM
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Softmax (naïve, block-wide)
+        // --------------------------------------------------------
+        if (k_idx < L) {
+            float exp_score = expf(score_tile[tid]);  // register
+            score_tile[tid] = exp_score;               // shared
+        }
+        __syncthreads();
+
+        // reduce sum of exp
+        if (tid == 0) {
+            float tmp = 0.0f;  // register
+            for (int t = 0; t < TILE_K && (k0 + t) < L; t++) {
+                tmp += score_tile[t];
+            }
+            sum_exp += tmp;   // register
+        }
+        __syncthreads();
+
+        // --------------------------------------------------------
+        // Accumulate weighted V
+        // --------------------------------------------------------
+        if (k_idx < L) {
+            float weight = score_tile[tid];  // shared → register
+            #pragma unroll
+            for (int d = 0; d < D; d++) {
+                out_reg[d] += weight * __half2float(V_tile[tid][d]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // ============================================================
+    // Normalize by softmax denominator and write output
+    // ============================================================
+    // registers → HBM
+    if (tid < D) {
+        O[q_idx * D + tid] = __float2half(out_reg[tid] / sum_exp);
     }
 }
