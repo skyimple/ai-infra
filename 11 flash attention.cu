@@ -1,99 +1,110 @@
 #include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 #include <math.h>
 #include <float.h>
 
-#define D 64
-#define BLOCK_K 128
-
-__global__ void flash_attention_kernel(
-    const float* Q,   // [L, D]  HBM
-    const float* K,   // [L, D]  HBM
-    const float* V,   // [L, D]  HBM
-    float* O,         // [L, D]  HBM
-    int L
+template<int D>
+__global__ void flash_attention_warp_kernel(
+    const float* __restrict__ Q,  // [L, D] in HBM
+    const float* __restrict__ K,  // [L, D] in HBM
+    const float* __restrict__ V,  // [L, D] in HBM
+    float* __restrict__ O,        // [L, D] in HBM
+    int L,
+    float scale                  // 1 / sqrt(D)
 ) {
-    // =====================================================
-    // Indices
-    // =====================================================
-    int q_idx = blockIdx.x;   // one block per query
-    int tid   = threadIdx.x;  // [0, BLOCK_K)
+    // --------------------------------------------------
+    // 1. warp owns one query Q[i]
+    // --------------------------------------------------
+    int i   = blockIdx.x;     // query index
+    int tid = threadIdx.x;    // lane id [0,31]
 
-    // =====================================================
-    // Shared memory
-    // =====================================================
-    __shared__ float K_tile[BLOCK_K][D];
-    __shared__ float V_tile[BLOCK_K][D];
+    static_assert(D % 32 == 0, "D must be divisible by 32");
 
-    // =====================================================
-    // Registers (thread-private)
-    // =====================================================
-    float q_reg[D];           // Q_i
-    float o_reg[D];           // output accumulator
+    const float* q_ptr = Q + i * D;
+    float*       o_ptr = O + i * D;
 
-    float m_i = -FLT_MAX;     // running max
-    float l_i = 0.0f;         // running sum(exp)
-
+    // --------------------------------------------------
+    // 2. Load Q into registers (HBM → registers)
+    // --------------------------------------------------
+    float q_reg[D / 32];
     #pragma unroll
-    for (int d = 0; d < D; ++d) {
-        q_reg[d] = Q[q_idx * D + d];
+    for (int d = 0; d < D / 32; ++d) {
+        q_reg[d] = q_ptr[tid + d * 32];
+    }
+
+    // --------------------------------------------------
+    // 3. Online softmax state (warp-shared, replicated)
+    // --------------------------------------------------
+    float m_i = -FLT_MAX;   // max so far
+    float l_i = 0.0f;       // sum exp so far
+
+    float o_reg[D / 32];
+    #pragma unroll
+    for (int d = 0; d < D / 32; ++d) {
         o_reg[d] = 0.0f;
     }
 
-    // =====================================================
-    // Loop over K/V blocks
-    // =====================================================
-    for (int k0 = 0; k0 < L; k0 += BLOCK_K) {
+    // --------------------------------------------------
+    // 4. Loop over all keys j
+    // --------------------------------------------------
+    for (int j = 0; j < L; ++j) {
 
-        int k_idx = k0 + tid;
+        // ---- 4.1 compute s_ij = Q_i · K_j
+        const float* k_ptr = K + j * D;
 
-        // -------------------------------------------------
-        // Load K/V tiles (HBM → shared)
-        // -------------------------------------------------
-        if (k_idx < L) {
-            #pragma unroll
-            for (int d = 0; d < D; ++d) {
-                K_tile[tid][d] = K[k_idx * D + d];
-                V_tile[tid][d] = V[k_idx * D + d];
-            }
+        float dot = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < D / 32; ++d) {
+            dot += q_reg[d] * k_ptr[tid + d * 32];
         }
-        __syncthreads();
 
-        // -------------------------------------------------
-        // Compute QK^T for this tile
-        // -------------------------------------------------
-        if (k_idx < L) {
-            float s_ij = 0.0f;
-            #pragma unroll
-            for (int d = 0; d < D; ++d) {
-                s_ij += q_reg[d] * K_tile[tid][d];
-            }
-            s_ij /= sqrtf((float)D);
-
-            // -------------------------------------------------
-            // FlashAttention online softmax update
-            // -------------------------------------------------
-            float m_new = fmaxf(m_i, s_ij);
-            float alpha = expf(m_i - m_new);
-            float beta  = expf(s_ij - m_new);
-
-            // update output
-            #pragma unroll
-            for (int d = 0; d < D; ++d) {
-                o_reg[d] = o_reg[d] * alpha + beta * V_tile[tid][d];
-            }
-
-            // update normalizer
-            l_i = l_i * alpha + beta;
-            m_i = m_new;
+        // warp-level reduction (sum)
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_xor_sync(0xffffffff, dot, offset);
         }
-        __syncthreads();
+
+        float s_ij = dot * scale;
+
+        // ---- 4.2 warp-level max(s_ij)
+        float m_ij = s_ij;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            m_ij = fmaxf(m_ij,
+                         __shfl_xor_sync(0xffffffff, m_ij, offset));
+        }
+
+        // ---- 4.3 online softmax update
+        float m_new = fmaxf(m_i, m_ij);
+        float alpha = expf(m_i - m_new);
+        float p_ij  = expf(s_ij - m_new);
+
+        // warp-level sum exp
+        float p_sum = p_ij;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            p_sum += __shfl_xor_sync(0xffffffff, p_sum, offset);
+        }
+
+        l_i = alpha * l_i + p_sum;
+
+        // ---- 4.4 update output O_i
+        const float* v_ptr = V + j * D;
+        #pragma unroll
+        for (int d = 0; d < D / 32; ++d) {
+            o_reg[d] = alpha * o_reg[d]
+                     + p_ij * v_ptr[tid + d * 32];
+        }
+
+        m_i = m_new;
     }
 
-    // =====================================================
-    // Final normalization
-    // =====================================================
+    // --------------------------------------------------
+    // 5. Normalize and write back (register → HBM)
+    // --------------------------------------------------
+    float inv_l = 1.0f / l_i;
     #pragma unroll
-    for (int d = 0; d < D; ++d) {
-        O[q_idx * D + d] = o_reg[d] / l_i;
+    for (int d = 0; d < D / 32; ++d) {
+        o_ptr[tid + d * 32] = o_reg[d] * inv_l;
     }
 }
