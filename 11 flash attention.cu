@@ -59,7 +59,7 @@ __global__ void flash_attention_warp_kernel(
         for (int offset = 16; offset > 0; offset >>= 1) {
             dot += __shfl_xor_sync(0xffffffff, dot, offset);
         }
-
+        // before we handle V, we got the complete s_{ij}
         float s_ij = dot * scale;
 
         // ---- 4.2 online softmax (NO warp max!)
@@ -70,7 +70,17 @@ __global__ void flash_attention_warp_kernel(
         l_i = alpha * l_i + p_ij;
 
         // ---- 4.3 update output accumulator
-        const float* v_ptr = V + j * D;
+        // 这里逐步更新的是S=Q*K^{T}的第i行的元素s_{ij}
+        // 从而更新的是最终输入的O的第i行
+        // 这一列的元素是S的第i行，同V的不同列的元素相乘产生的结果
+        // 看似是不同列，但S的元素是逐个产生的
+        // 最新的s_{ij}，同V中产生关联的元素，恰恰是V的第j行的不同元素
+        // 这里每个thread的o_reg就是保存了O的第i行的元素
+
+        // 这行控制了关注V的第j行
+        const float* v_ptr = V + j * D; 
+        // 每个thread负责更新的是V的第j行的
+        // tid + d*32 序号的元素，也可以理解为tid + d*32列
         #pragma unroll
         for (int d = 0; d < D / 32; ++d) {
             o_reg[d] = alpha * o_reg[d]
@@ -83,6 +93,8 @@ __global__ void flash_attention_warp_kernel(
     // --------------------------------------------------
     // 5. Normalize and write back
     // --------------------------------------------------
+    // 最后更新o_ptr
+    // 每个thread更新的是tid开始，间隔32个位置，共D/32个元素
     float inv_l = 1.0f / l_i;
     #pragma unroll
     for (int d = 0; d < D / 32; ++d) {
